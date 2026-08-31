@@ -1,22 +1,28 @@
-const DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_CHAT_MODEL = "gpt-4o-mini";
-const DEFAULT_TTS_MODEL = "gpt-4o-mini-tts";
-const DEFAULT_TRANSLATION_PROMPT = "You are a professional translation engine. Translate faithfully, preserve formatting, and return only the translated text.";
-const DEFAULT_OCR_PROMPT = "You are a precise OCR engine. Extract visible text from images, preserve reading order and line breaks, and return only the recognized text.";
-const DEFAULT_TTS_INSTRUCTIONS = "Speak clearly and naturally. Preserve the language and meaning of the input text.";
+const API_ENDPOINT = "https://api.mojidict.com/parse/functions";
+const WEB_DETAIL_URL = "https://www.mojidict.com/details/";
+const WEB_SEARCH_URL = "https://www.mojidict.com/searchText/";
+
+const SEARCH_TYPE_WORD = 102;
+const SEARCH_TYPE_EXAMPLE = 103;
+const SEARCH_TYPE_GRAMMAR = 106;
+
+const MAX_GRAMMAR_MEANINGS = 5;
+const RETRY_DELAY_MS = 600;
+// 平假名、片假名、汉字与半角片假名。
+const JAPANESE_PATTERN = /[぀-ヿ㐀-䶿一-鿿ｦ-ﾟ]/;
+
+// MOJi Web 客户端的公开参数，用户无需配置。
+const CLIENT_PAYLOAD = {
+  _ClientVersion: "js3.4.1",
+  _ApplicationId: "E62VyFVLMiW7kvbtVq3p",
+  g_os: "PCWeb",
+  g_ver: "v4.8.8.20240829",
+  _InstallationId: "1b2822a6-ede5-43e3-addb-00003642f992",
+};
 
 function stringValue(value, fallback = "") {
   const text = String(value ?? "").trim();
   return text || fallback;
-}
-
-function numberValue(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function clampedNumberValue(value, fallback, min, max) {
-  return Math.min(max, Math.max(min, numberValue(value, fallback)));
 }
 
 function booleanValue(value, fallback = false) {
@@ -29,287 +35,485 @@ function booleanValue(value, fallback = false) {
   return fallback;
 }
 
-function apiUrl(baseUrl, path) {
-  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+function integerValue(value, fallback, min, max) {
+  const number = Number(value);
+  const resolved = Number.isFinite(number) ? Math.trunc(number) : fallback;
+  return Math.min(max, Math.max(min, resolved));
 }
 
-function chatCompletionsUrl(baseUrl) {
-  return apiUrl(baseUrl, "/chat/completions");
+function hasJapanese(text) {
+  return JAPANESE_PATTERN.test(text);
 }
 
-function speechUrl(baseUrl) {
-  return apiUrl(baseUrl, "/audio/speech");
+function truncated(text, limit = 24) {
+  const characters = [...text];
+  return characters.length > limit ? `${characters.slice(0, limit).join("")}…` : text;
 }
 
-function sourceLanguage(from, options) {
-  const detected = stringValue(options?.detect);
-  const source = stringValue(from);
-  if (source && source !== "auto") return source;
-  if (detected && detected !== "auto") return detected;
-  return "the source language";
+function sortedByIndex(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((item) => item && typeof item === "object")
+    .map((item, position) => ({ item, position }))
+    .sort((a, b) => {
+      const left = Number(a.item.index);
+      const right = Number(b.item.index);
+      const leftIndex = Number.isFinite(left) ? left : Number.MAX_SAFE_INTEGER;
+      const rightIndex = Number.isFinite(right) ? right : Number.MAX_SAFE_INTEGER;
+      return leftIndex === rightIndex ? a.position - b.position : leftIndex - rightIndex;
+    })
+    .map((entry) => entry.item);
 }
 
-function requestedOcrLanguage(language) {
-  const value = stringValue(language);
-  return value && value !== "auto" ? value : "the image's original language";
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function commonPayload(config, defaultPrompt) {
-  return {
-    model: stringValue(config.model, DEFAULT_CHAT_MODEL),
-    temperature: numberValue(config.temperature, 0.2),
-    max_tokens: Math.max(1, Math.trunc(numberValue(config.maxTokens, 2048))),
-    stream: booleanValue(config.stream, true),
-    messages: [
-      {
-        role: "system",
-        content: stringValue(config.systemPrompt, defaultPrompt),
-      },
-    ],
-  };
-}
-
-function translationUserPrompt(text, from, to, options) {
-  return [
-    `Translate from ${sourceLanguage(from, options)} to ${stringValue(to, "the target language")}.`,
-    "Return only the translated text. Do not add explanations, quotes, or markdown fences.",
-    "",
-    text,
-  ].join("\n");
-}
-
-function translationPayload(text, from, to, options) {
-  const config = options.config || {};
-  const payload = commonPayload(config, DEFAULT_TRANSLATION_PROMPT);
-  payload.messages.push({
-    role: "user",
-    content: translationUserPrompt(text, from, to, options),
-  });
-  return payload;
-}
-
-function ocrPayload(base64, language, options) {
-  const config = options.config || {};
-  const payload = commonPayload(config, DEFAULT_OCR_PROMPT);
-  payload.max_tokens = Math.max(1, Math.trunc(numberValue(config.maxTokens, 4096)));
-  payload.messages.push({
-    role: "user",
-    content: [
-      {
-        type: "text",
-        text: [
-          `Extract all visible text from this image. The expected language is ${requestedOcrLanguage(language)}.`,
-          "Preserve reading order, paragraphs, and line breaks as much as possible.",
-          "Return only the recognized text. If there is no visible text, return an empty string.",
-        ].join("\n"),
-      },
-      {
-        type: "image_url",
-        image_url: {
-          url: `data:image/png;base64,${base64}`,
-          detail: stringValue(config.imageDetail, "auto"),
-        },
-      },
-    ],
-  });
-  return payload;
-}
-
-function speechVoice(value) {
-  const voice = stringValue(value, "marin");
-
-  if (voice.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(voice);
-      if (parsed && typeof parsed === "object" && typeof parsed.id === "string") {
-        return { id: parsed.id.trim() };
-      }
-    } catch (_) {
-      return voice;
-    }
+// MOJi 偶发返回 429/5xx，重试一次即可，避免把瞬时限流暴露给用户。
+async function fetchWithRetry(fetchImpl, url, init) {
+  let response = await fetchImpl(url, init);
+  if (response.status === 429 || response.status >= 500) {
+    await delay(RETRY_DELAY_MS);
+    response = await fetchImpl(url, init);
   }
-
-  if (voice.startsWith("voice_")) {
-    return { id: voice };
-  }
-
-  return voice;
-}
-
-function ttsPayload(text, language, options) {
-  const config = options.config || {};
-  const payload = {
-    model: stringValue(config.model, DEFAULT_TTS_MODEL),
-    input: text,
-    voice: speechVoice(config.voice),
-    response_format: stringValue(config.responseFormat, "mp3"),
-    speed: clampedNumberValue(config.speed, 1, 0.25, 4.0),
-  };
-
-  const instructions = stringValue(config.instructions, DEFAULT_TTS_INSTRUCTIONS);
-  if (instructions) {
-    payload.instructions = instructions;
-  }
-
-  const normalizedLanguage = stringValue(language);
-  if (normalizedLanguage && normalizedLanguage !== "auto" && payload.voice && typeof payload.voice === "object") {
-    payload.language = normalizedLanguage;
-  }
-
-  return payload;
-}
-
-function responseMessage(payload) {
-  const content = payload?.choices?.[0]?.message?.content;
-  if (typeof content === "string") return content.trim();
-
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => typeof part === "string" ? part : part?.text || "")
-      .join("")
-      .trim();
-  }
-
-  return "";
-}
-
-async function readErrorResponse(response) {
-  try {
-    const payload = await response.json();
-    return payload?.error?.message || JSON.stringify(payload);
-  } catch (_) {
-    return await response.text();
-  }
-}
-
-async function readWithoutStreaming(response, { allowEmpty = false } = {}) {
-  const payload = await response.json();
-  const text = responseMessage(payload);
-  if (!allowEmpty && !text) {
-    throw new Error(`OpenAI-compatible response did not include text: ${JSON.stringify(payload)}`);
-  }
-  return text;
-}
-
-async function readWithStreaming(response, options, { allowEmpty = false } = {}) {
-  if (!response.body?.getReader) {
-    return await readWithoutStreaming(response, { allowEmpty });
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let result = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
-
-    for (const event of events) {
-      for (const line of event.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-
-        const data = trimmed.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
-
-        let payload;
-        try {
-          payload = JSON.parse(data);
-        } catch (_) {
-          continue;
-        }
-
-        const delta = payload?.choices?.[0]?.delta?.content || "";
-        if (delta) {
-          result += delta;
-          options.setResult?.(delta);
-        }
-      }
-    }
-  }
-
-  const text = result.trim();
-  if (!allowEmpty && !text) {
-    throw new Error("OpenAI-compatible stream did not include text.");
-  }
-  return text;
-}
-
-async function postJson(url, payload, options) {
-  const config = options.config || {};
-  const apiKey = stringValue(config.apiKey);
-  if (!apiKey) {
-    throw new Error("API key is required.");
-  }
-
-  const response = await options.utils.fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${await readErrorResponse(response)}`);
-  }
-
   return response;
 }
 
-async function postChatCompletion(payload, options) {
-  const config = options.config || {};
-  return await postJson(chatCompletionsUrl(stringValue(config.baseUrl, DEFAULT_BASE_URL)), payload, options);
-}
-
-async function postSpeech(payload, options) {
-  const config = options.config || {};
-  return await postJson(speechUrl(stringValue(config.baseUrl, DEFAULT_BASE_URL)), payload, options);
-}
-
-async function readChatCompletion(response, payload, options, readOptions) {
-  return payload.stream
-    ? await readWithStreaming(response, options, readOptions)
-    : await readWithoutStreaming(response, readOptions);
-}
-
-export async function translate(text, from, to, options) {
-  const payload = translationPayload(text, from, to, options);
-  const response = await postChatCompletion(payload, options);
-  return await readChatCompletion(response, payload, options, { allowEmpty: false });
-}
-
-export async function recognize(base64, language, options) {
-  if (!stringValue(base64)) {
-    throw new Error("Image content is required.");
+async function callMojiFunction(name, params, options) {
+  const fetchImpl = options?.utils?.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new Error("当前运行环境没有提供 utils.fetch。");
   }
 
-  const payload = ocrPayload(base64, language, options);
-  const response = await postChatCompletion(payload, options);
-  return await readChatCompletion(response, payload, options, { allowEmpty: true });
-}
+  const response = await fetchWithRetry(fetchImpl, `${API_ENDPOINT}/${name}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json;charset=UTF-8" },
+    body: JSON.stringify({ ...CLIENT_PAYLOAD, ...params }),
+  });
 
-export async function tts(text, language, options) {
-  if (!stringValue(text)) {
-    throw new Error("Text content is required.");
+  if (!response.ok) {
+    throw new Error(`MOJi辞書 请求失败：HTTP ${response.status}`);
   }
 
-  const payload = ttsPayload(text, language, options);
-  const response = await postSpeech(payload, options);
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    throw new Error("MOJi辞書 返回了无法解析的响应。");
+  }
 
-  if (bytes.length === 0) {
-    throw new Error("OpenAI speech response did not include audio data.");
+  const result = payload?.result;
+  if (!result || typeof result !== "object") {
+    throw new Error(`MOJi辞書 返回了意外的响应结构：${JSON.stringify(payload).slice(0, 200)}`);
+  }
+
+  return result;
+}
+
+function normalizeSearchSection(section) {
+  const items = Array.isArray(section?.searchResult) ? section.searchResult : [];
+  return items
+    .map((item) => ({
+      id: stringValue(item?.targetId),
+      title: stringValue(item?.title),
+      excerpt: stringValue(item?.excerpt),
+    }))
+    .filter((item) => item.title || item.excerpt);
+}
+
+async function searchAll(text, options) {
+  const result = await callMojiFunction(
+    "union-api",
+    {
+      functions: [
+        {
+          name: "search-all",
+          params: {
+            text,
+            types: [SEARCH_TYPE_WORD, SEARCH_TYPE_GRAMMAR, SEARCH_TYPE_EXAMPLE],
+          },
+        },
+      ],
+    },
+    options,
+  );
+
+  const searchResult = result?.results?.["search-all"]?.result;
+  if (!searchResult || typeof searchResult !== "object") {
+    throw new Error(`MOJi辞書 搜索失败：${JSON.stringify(result).slice(0, 200)}`);
   }
 
   return {
-    bytes,
-    format: payload.response_format,
+    words: normalizeSearchSection(searchResult.word),
+    grammars: normalizeSearchSection(searchResult.grammar),
+    examples: normalizeSearchSection(searchResult.example),
   };
 }
+
+async function fetchWordDetail(wordId, options) {
+  const result = await callMojiFunction("fetchWord_v2", { wordId, skipAccessories: false }, options);
+  const word = result?.word;
+  if (!word || typeof word !== "object") {
+    throw new Error("MOJi辞書 没有返回词条详情。");
+  }
+
+  return {
+    word,
+    details: sortedByIndex(result.details),
+    subdetails: sortedByIndex(result.subdetails),
+    examples: sortedByIndex(result.examples),
+  };
+}
+
+async function fetchPronunciationUrl(wordId, options) {
+  const result = await callMojiFunction(
+    "fetchTts_v2",
+    { tarId: wordId, tarType: SEARCH_TYPE_WORD, voiceId: 0 },
+    options,
+  );
+  return stringValue(result?.result?.url);
+}
+
+function titleSpell(title) {
+  return stringValue(stringValue(title).split("|")[0]);
+}
+
+function titleReading(title) {
+  const parts = stringValue(title).split("|");
+  return parts.length > 1 ? stringValue(parts.slice(1).join("|")) : "";
+}
+
+function titleKana(title) {
+  return titleReading(title).replace(/[^ぁ-ゟァ-ヿー]/g, "");
+}
+
+// 比较词形时忽略 MOJi 条目里的占位符号与空白，例如「〜ながら」对应「ながら」。
+function normalizeForMatch(text) {
+  return stringValue(text).replace(/[〜~～…・\s]/g, "");
+}
+
+function pickWord(words, text) {
+  const query = stringValue(text);
+  return words.find((word) => titleSpell(word.title) === query) || words[0] || null;
+}
+
+function findSpeakableWord(candidates, text, strictMatch) {
+  const query = normalizeForMatch(text);
+  const speakable = candidates.filter((candidate) => candidate.id);
+
+  const exact = speakable.find((candidate) => {
+    return (
+      normalizeForMatch(titleSpell(candidate.title)) === query ||
+      normalizeForMatch(titleKana(candidate.title)) === query
+    );
+  });
+  if (exact) return exact;
+
+  return strictMatch ? null : speakable[0] || null;
+}
+
+async function downloadAudio(url, options) {
+  const fetchImpl = options?.utils?.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new Error("当前运行环境没有提供 utils.fetch。");
+  }
+
+  const response = await fetchWithRetry(fetchImpl, url, { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`MOJi辞書 发音下载失败：HTTP ${response.status}`);
+  }
+
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.length === 0) {
+    throw new Error("MOJi辞書 返回的发音内容为空。");
+  }
+
+  return bytes;
+}
+
+function formatPartOfSpeech(title) {
+  return stringValue(title).replace(/#/g, "·");
+}
+
+function formatExamplePair(source, translation) {
+  const left = stringValue(source);
+  const right = stringValue(translation);
+  if (left && right) return `${left} —— ${right}`;
+  return left || right;
+}
+
+function detailMeanings(detail, maxExamples) {
+  const partsOfSpeech = new Map(
+    detail.details.map((item) => [stringValue(item.objectId), formatPartOfSpeech(item.title)]),
+  );
+
+  const examplesBySubdetail = new Map();
+  for (const example of detail.examples) {
+    const key = stringValue(example.subdetailsId);
+    if (!key) continue;
+    const formatted = formatExamplePair(example.title, example.trans);
+    if (!formatted) continue;
+    if (!examplesBySubdetail.has(key)) examplesBySubdetail.set(key, []);
+    examplesBySubdetail.get(key).push(formatted);
+  }
+
+  const meanings = [];
+  for (const subdetail of detail.subdetails) {
+    const translation = stringValue(subdetail.title);
+    const examples = (examplesBySubdetail.get(stringValue(subdetail.objectId)) || []).slice(0, maxExamples);
+    if (!translation && examples.length === 0) continue;
+
+    const meaning = {};
+    const partOfSpeech = partsOfSpeech.get(stringValue(subdetail.detailsId));
+    if (partOfSpeech) meaning.partOfSpeech = partOfSpeech;
+    if (translation) meaning.translations = [translation];
+    if (examples.length) meaning.examples = examples;
+    meanings.push(meaning);
+  }
+
+  if (meanings.length) return meanings;
+
+  // 词条没有分义项时，退回到词条摘要加全部例句。
+  const excerpt = stringValue(detail.word.excerpt);
+  const examples = detail.examples
+    .map((example) => formatExamplePair(example.title, example.trans))
+    .filter(Boolean)
+    .slice(0, maxExamples);
+
+  if (!excerpt && examples.length === 0) return [];
+
+  const meaning = {};
+  const partOfSpeech = formatPartOfSpeech(detail.details[0]?.title);
+  if (partOfSpeech) meaning.partOfSpeech = partOfSpeech;
+  if (excerpt) meaning.translations = [excerpt];
+  if (examples.length) meaning.examples = examples;
+  return [meaning];
+}
+
+function summaryMeanings(word) {
+  const excerpt = stringValue(word?.excerpt);
+  if (!excerpt) return [];
+
+  const matched = excerpt.match(/^\[([^\]]+)\]\s*([\s\S]*)$/);
+  const meaning = {};
+  if (matched) {
+    const partOfSpeech = stringValue(matched[1]);
+    const translation = stringValue(matched[2]);
+    if (partOfSpeech) meaning.partOfSpeech = formatPartOfSpeech(partOfSpeech);
+    if (translation) meaning.translations = [translation];
+  } else {
+    meaning.translations = [excerpt];
+  }
+
+  return meaning.translations?.length ? [meaning] : [];
+}
+
+function grammarMeanings(grammars, limit) {
+  return grammars
+    .slice(0, limit)
+    .map((grammar) => {
+      const label = stringValue(grammar.title);
+      const explanation = stringValue(grammar.excerpt).replace(/^\[文法\]\s*/, "");
+      const meaning = { partOfSpeech: "文法" };
+      if (explanation) {
+        meaning.translations = [explanation];
+        if (label) meaning.tags = [label];
+      } else if (label) {
+        meaning.translations = [label];
+      }
+      return meaning;
+    })
+    .filter((meaning) => meaning.translations?.length);
+}
+
+function exampleMeaning(examples, limit) {
+  const formatted = examples
+    .map((example) => formatExamplePair(example.title, example.excerpt))
+    .filter(Boolean)
+    .slice(0, limit);
+  return formatted.length ? { partOfSpeech: "例文", examples: formatted } : null;
+}
+
+function buildPronunciations(detailWord, searchWord, audioUrl) {
+  const pronunciations = [];
+  const kana = stringValue(detailWord?.pron);
+  const accent = stringValue(detailWord?.accent);
+  const reading = [kana, accent].filter(Boolean).join(" ") || titleReading(searchWord?.title);
+
+  if (reading || audioUrl) {
+    const pronunciation = { label: "かな" };
+    if (reading) pronunciation.phonetic = reading;
+    if (audioUrl) pronunciation.audioUrl = audioUrl;
+    pronunciations.push(pronunciation);
+  }
+
+  const romaji = stringValue(detailWord?.romaji);
+  if (romaji) pronunciations.push({ label: "ローマ字", phonetic: romaji });
+
+  return pronunciations;
+}
+
+function buildTags(detailWord) {
+  const raw = stringValue(detailWord?.tags);
+  if (!raw) return [];
+  const tags = raw
+    .split(/[#、,，\s]+/)
+    .map((tag) => stringValue(tag))
+    .filter(Boolean);
+  return [...new Set(tags)];
+}
+
+function buildProperties(primaryWord, relatedWords) {
+  const properties = [{ key: "source", label: "来源", value: "MOJi辞書" }];
+
+  if (primaryWord?.id) {
+    properties.push({
+      key: "detailUrl",
+      label: "词条链接",
+      value: `${WEB_DETAIL_URL}${primaryWord.id}`,
+    });
+  }
+
+  relatedWords.forEach((word, index) => {
+    const value = [stringValue(word.title), stringValue(word.excerpt)].filter(Boolean).join("  ");
+    if (!value) return;
+    properties.push({ key: `relatedWord${index + 1}`, label: "相关词条", value });
+  });
+
+  return properties;
+}
+
+export async function translate(text, from, to, options) {
+  const query = stringValue(text);
+  if (!query) {
+    throw new Error("请输入要查询的内容。");
+  }
+
+  const config = options?.config || {};
+  const maxExamples = integerValue(config.maxExamples, 3, 0, 20);
+  const maxRelatedWords = integerValue(config.maxRelatedWords, 4, 0, 20);
+
+  const search = await searchAll(query, options);
+  const primaryWord = pickWord(search.words, query);
+
+  let detail = null;
+  if (primaryWord?.id && booleanValue(config.detailedLookup, true)) {
+    try {
+      detail = await fetchWordDetail(primaryWord.id, options);
+    } catch (_) {
+      detail = null;
+    }
+  }
+
+  let audioUrl = "";
+  if (primaryWord?.id && booleanValue(config.pronunciationAudio, true)) {
+    try {
+      audioUrl = await fetchPronunciationUrl(primaryWord.id, options);
+    } catch (_) {
+      audioUrl = "";
+    }
+  }
+
+  const meanings = [];
+  if (detail) meanings.push(...detailMeanings(detail, maxExamples));
+  if (!meanings.length && primaryWord) meanings.push(...summaryMeanings(primaryWord));
+  if (booleanValue(config.includeGrammar, true)) {
+    meanings.push(...grammarMeanings(search.grammars, MAX_GRAMMAR_MEANINGS));
+  }
+  if (booleanValue(config.includeExamples, true)) {
+    const meaning = exampleMeaning(search.examples, maxExamples);
+    if (meaning) meanings.push(meaning);
+  }
+
+  if (!meanings.length) {
+    throw new Error(`MOJi辞書 没有找到“${truncated(query)}”的释义。`);
+  }
+
+  const dictionary = {
+    word: stringValue(detail?.word?.spell) || titleSpell(primaryWord?.title) || query,
+    language: "ja_JP",
+    meanings,
+  };
+
+  const pronunciations = buildPronunciations(detail?.word, primaryWord, audioUrl);
+  if (pronunciations.length) dictionary.pronunciations = pronunciations;
+
+  const tags = buildTags(detail?.word);
+  if (tags.length) dictionary.tags = tags;
+
+  const relatedWords = search.words
+    .filter((word) => !primaryWord || word.id !== primaryWord.id)
+    .slice(0, maxRelatedWords);
+  dictionary.properties = buildProperties(primaryWord, relatedWords);
+
+  if (audioUrl) dictionary.audioUrl = audioUrl;
+
+  return { kind: "dictionary", dictionary };
+}
+
+// MOJi 只为词典收录的词条和文法条目提供录音，不支持任意文本合成。
+export async function tts(text, language, options) {
+  const query = stringValue(text);
+  if (!query) {
+    throw new Error("请输入要朗读的内容。");
+  }
+
+  const config = options?.config || {};
+  const maxLength = integerValue(config.maxLength, 32, 1, 200);
+  if ([...query].length > maxLength) {
+    throw new Error(`MOJi辞書 只能朗读词典收录的词条，当前文本超过 ${maxLength} 个字符。`);
+  }
+
+  const search = await searchAll(query, options);
+  const word = findSpeakableWord(
+    [...search.words, ...search.grammars],
+    query,
+    booleanValue(config.strictMatch, true),
+  );
+
+  if (!word) {
+    throw new Error(`MOJi辞書 没有收录“${truncated(query)}”对应的词条发音。`);
+  }
+
+  const audioUrl = await fetchPronunciationUrl(word.id, options);
+  if (!audioUrl) {
+    throw new Error(`MOJi辞書 没有提供“${truncated(titleSpell(word.title) || query)}”的发音音频。`);
+  }
+
+  return {
+    bytes: await downloadAudio(audioUrl, options),
+    format: "mp3",
+  };
+}
+
+export function canOpenInMoji(selectedText, options) {
+  const text = stringValue(selectedText);
+  if (!text) return false;
+
+  const config = options?.config || {};
+  if ([...text].length > integerValue(config.maxLength, 32, 1, 200)) return false;
+  if (booleanValue(config.japaneseOnly, false) && !hasJapanese(text)) return false;
+
+  return true;
+}
+
+export function openInMoji(selectedText, options) {
+  const text = stringValue(selectedText);
+  if (!text) {
+    throw new Error("选中的内容为空。");
+  }
+
+  const openWithDefaultBrowser = options?.manggo?.openWithDefaultBrowser;
+  if (typeof openWithDefaultBrowser !== "function") {
+    throw new Error("当前运行环境没有提供 manggo.openWithDefaultBrowser。");
+  }
+
+  openWithDefaultBrowser(`${WEB_SEARCH_URL}${encodeURIComponent(text)}`);
+}
+
+export default {
+  translate,
+  tts,
+  canOpenInMoji,
+  openInMoji,
+};
