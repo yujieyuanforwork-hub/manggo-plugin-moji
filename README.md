@@ -742,3 +742,5 @@ zip -r dist/my-plugin.mplugin manggo.plugin.json main.js icon.png assets
 ## 本仓库示例
 
 本仓库包含一个使用 OpenAI 兼容接口实现翻译、OCR 和语音合成的原生插件示例。可参考 [`manggo.plugin.json`](./manggo.plugin.json) 的多服务声明和 [`main.js`](./main.js) 的网络请求、流式响应及音频返回实现；运行 `./package.sh` 可在 `dist/` 下生成示例 `.mplugin`。
+
+仓库还包含一个基于 MOJi辞書 公开接口的日语词典插件 [`moji-dict/`](./moji-dict)，无需配置即可使用。它演示了 `resultType: "dictionary"` 的结构化词典返回值、返回 mp3 字节的语音服务，以及在同一个插件里同时声明多个普通服务和划词动作的写法，运行 `moji-dict/package.sh` 可在 `moji-dict/dist/` 下生成 `.mplugin`。
