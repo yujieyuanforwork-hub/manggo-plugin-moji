@@ -6,7 +6,7 @@
 
 ## 安装
 
-1. 克隆本仓库后执行 `./package.sh`，在 `dist/` 下得到 `io.github.yujieyuanforwork-hub.moji-dict.mplugin`。
+1. 克隆本仓库后执行 `./package.sh`，在 `dist/` 下得到 mplugin。
 2. 打开 Manggo 的「插件管理」页面，安装该 `.mplugin` 文件。
 3. 到「服务设置 - 翻译」添加词典服务、「服务设置 - 语音」添加发音服务；划词动作安装后自动出现在「划词助手」列表中。
 
