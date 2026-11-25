@@ -8,6 +8,8 @@ const SEARCH_TYPE_GRAMMAR = 106;
 
 const MAX_GRAMMAR_MEANINGS = 5;
 const RETRY_DELAY_MS = 600;
+const PRONUNCIATION_AUDIO_CAPABILITY = "translation.pronunciationAudio";
+const AUDIO_CONTENT_TYPE = "audio/mpeg";
 // 平假名、片假名、汉字与半角片假名。
 const JAPANESE_PATTERN = /[぀-ヿ㐀-䶿一-鿿ｦ-ﾟ]/;
 
@@ -36,9 +38,36 @@ function booleanValue(value, fallback = false) {
 }
 
 function integerValue(value, fallback, min, max) {
-  const number = Number(value);
+  // 新版 Manggo 对未保存且无默认值的字段传 null；null/空串按默认值处理，避免 Number(null) === 0。
+  const number = value === null || value === undefined || value === "" ? NaN : Number(value);
   const resolved = Number.isFinite(number) ? Math.trunc(number) : fallback;
   return Math.min(max, Math.max(min, resolved));
+}
+
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// 纯 JS 实现，不依赖 btoa/Buffer 是否存在于宿主的 JavaScript 引擎。
+function bytesToBase64(bytes) {
+  let output = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const a = bytes[index];
+    const b = index + 1 < bytes.length ? bytes[index + 1] : 0;
+    const c = index + 2 < bytes.length ? bytes[index + 2] : 0;
+    const triple = (a << 16) | (b << 8) | c;
+    output += BASE64_ALPHABET[(triple >> 18) & 63];
+    output += BASE64_ALPHABET[(triple >> 12) & 63];
+    output += index + 1 < bytes.length ? BASE64_ALPHABET[(triple >> 6) & 63] : "=";
+    output += index + 2 < bytes.length ? BASE64_ALPHABET[triple & 63] : "=";
+  }
+  return output;
+}
+
+// 词典音标旁的播放按钮需要宿主支持 translation.pronunciationAudio；
+// 不支持的宿主会把 audio 当作未知字段拒绝整条词典结果，因此先做能力检测。
+function supportsPronunciationAudio(options) {
+  const env = options?.manggo?.env ?? globalThis.manggo?.env;
+  const capabilities = env?.capabilities;
+  return Array.isArray(capabilities) && capabilities.includes(PRONUNCIATION_AUDIO_CAPABILITY);
 }
 
 function hasJapanese(text) {
@@ -89,6 +118,7 @@ async function callMojiFunction(name, params, options) {
     method: "POST",
     headers: { "Content-Type": "application/json;charset=UTF-8" },
     body: JSON.stringify({ ...CLIENT_PAYLOAD, ...params }),
+    signal: options?.signal,
   });
 
   if (!response.ok) {
@@ -218,7 +248,7 @@ async function downloadAudio(url, options) {
     throw new Error("当前运行环境没有提供 utils.fetch。");
   }
 
-  const response = await fetchWithRetry(fetchImpl, url, { method: "GET" });
+  const response = await fetchWithRetry(fetchImpl, url, { method: "GET", signal: options?.signal });
   if (!response.ok) {
     throw new Error(`MOJi辞書 发音下载失败：HTTP ${response.status}`);
   }
@@ -334,16 +364,32 @@ function exampleMeaning(examples, limit) {
   return formatted.length ? { partOfSpeech: "例文", examples: formatted } : null;
 }
 
-function buildPronunciations(detailWord, searchWord, audioUrl) {
+// MOJi 的录音地址是约 1 小时过期的签名 URL；内嵌 Base64 让翻译历史里的发音也能重放。
+// 下载失败时退回 URL，至少保证当次查询能播放。
+async function fetchPronunciationAudio(wordId, options) {
+  const url = await fetchPronunciationUrl(wordId, options);
+  if (!url) return null;
+  try {
+    const bytes = await downloadAudio(url, options);
+    return { base64: bytesToBase64(bytes), contentType: AUDIO_CONTENT_TYPE };
+  } catch (_) {
+    return { url, contentType: AUDIO_CONTENT_TYPE };
+  }
+}
+
+// 新版词典协议：phonetic 必填，音频放在 audio 对象里，不再接受 audioUrl。
+function buildPronunciations(detailWord, searchWord, audio) {
   const pronunciations = [];
   const kana = stringValue(detailWord?.pron);
   const accent = stringValue(detailWord?.accent);
   const reading = [kana, accent].filter(Boolean).join(" ") || titleReading(searchWord?.title);
+  // 外来语等词条可能没有假名读音，有录音时用词形本身作为音标承载播放按钮。
+  const phonetic =
+    reading || (audio ? stringValue(detailWord?.spell) || titleSpell(searchWord?.title) : "");
 
-  if (reading || audioUrl) {
-    const pronunciation = { label: "かな" };
-    if (reading) pronunciation.phonetic = reading;
-    if (audioUrl) pronunciation.audioUrl = audioUrl;
+  if (phonetic) {
+    const pronunciation = { label: "かな", phonetic };
+    if (audio) pronunciation.audio = audio;
     pronunciations.push(pronunciation);
   }
 
@@ -405,12 +451,16 @@ export async function translate(text, from, to, options) {
     }
   }
 
-  let audioUrl = "";
-  if (primaryWord?.id && booleanValue(config.pronunciationAudio, true)) {
+  let audio = null;
+  if (
+    primaryWord?.id &&
+    booleanValue(config.pronunciationAudio, true) &&
+    supportsPronunciationAudio(options)
+  ) {
     try {
-      audioUrl = await fetchPronunciationUrl(primaryWord.id, options);
+      audio = await fetchPronunciationAudio(primaryWord.id, options);
     } catch (_) {
-      audioUrl = "";
+      audio = null;
     }
   }
 
@@ -435,7 +485,7 @@ export async function translate(text, from, to, options) {
     meanings,
   };
 
-  const pronunciations = buildPronunciations(detail?.word, primaryWord, audioUrl);
+  const pronunciations = buildPronunciations(detail?.word, primaryWord, audio);
   if (pronunciations.length) dictionary.pronunciations = pronunciations;
 
   const tags = buildTags(detail?.word);
@@ -445,8 +495,6 @@ export async function translate(text, from, to, options) {
     .filter((word) => !primaryWord || word.id !== primaryWord.id)
     .slice(0, maxRelatedWords);
   dictionary.properties = buildProperties(primaryWord, relatedWords);
-
-  if (audioUrl) dictionary.audioUrl = audioUrl;
 
   return { kind: "dictionary", dictionary };
 }

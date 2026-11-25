@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "io.github.yujieyuanforwork-hub.moji-dict",
   "name": "MOJi辞書",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "使用 MOJi辞書 公开接口的日语词典插件，无需配置即可查询词条、读音、义项、例句和文法条目，并朗读词条发音。",
   "author": "yujieyuan",
   "homepage": "https://github.com/yujieyuanforwork-hub/moji",
@@ -47,7 +47,7 @@
           "label": "获取发音音频",
           "control": "boolean",
           "default": true,
-          "description": "开启后请求 MOJi 的词条发音地址，可在结果中直接朗读。"
+          "description": "开启后下载 MOJi 的词条录音并内嵌到结果中，在假名读音旁显示播放按钮（需要支持发音音频的 Manggo 版本），翻译历史中也能重放。"
         },
         {
           "key": "includeGrammar",
